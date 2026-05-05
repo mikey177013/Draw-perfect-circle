@@ -1,8 +1,8 @@
 {
-  "name": "perfect-circle",
-  "version": "1.0.0",
+  "name": "draw-perfect-circle",
+  "version": "2.0.0",
   "private": true,
-  "description": "Draw a perfect circle. Get scored on precision.",
+  "description": "Draw a perfect circle from a fixed center. Get scored on precision.",
   "scripts": {
     "start": "npx serve . -l 3000",
     "dev": "npx serve . -l 3000"

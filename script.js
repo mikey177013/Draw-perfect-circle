@@ -1,8 +1,8 @@
-/* Perfect Circle — minimal premium build
-   - Crisp DPR-aware canvas
-   - Smooth quadratic curve drawing
-   - Accurate circle scoring (radial deviation)
-   - Animated overlay of the ideal circle
+/* Perfect Circle — premium build
+   - Fixed center dot anchor
+   - Free, smooth, low-latency brush (no auto-improve)
+   - Detects "took too long" and "changed direction"
+   - Shows ONLY the user-drawn circle on the result screen
 */
 
 (() => {
@@ -16,23 +16,42 @@
   const scoreEl = document.getElementById("score");
   const retryBtn = document.getElementById("retry");
   const bestEl = document.getElementById("best-value");
+  const messageEl = document.getElementById("message");
+  const messageTextEl = document.getElementById("message-text");
+
+  // ───── Tunables ─────
+  const BRUSH_WIDTH = 5.5;          // thicker brush
+  const BRUSH_COLOR = "#ffffff";
+  const CENTER_DOT_RADIUS = 6;
+  const CENTER_DOT_HALO = 14;
+  const MIN_RADIUS = 28;            // ignore tiny scribbles
+  const MAX_DRAW_TIME_MS = 6000;    // "you took too long"
+  const DIRECTION_LOCK_ANGLE = Math.PI * 0.35; // ~63° net rotation before locking
+  const DIRECTION_REVERSE_ANGLE = Math.PI * 0.55; // reverse threshold
+  const START_RADIUS_TOLERANCE = 90; // user must start near the center dot
 
   // ───── State ─────
   let dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
   let width = 0;
   let height = 0;
+  let centerX = 0;
+  let centerY = 0;
 
   let drawing = false;
-  let points = [];        // raw points {x, y, t}
-  let lastDrawIndex = 0;  // index of last point that was rendered to ctx
+  let points = [];                  // {x, y, t}
+  let lastDrawIndex = 0;
   let rafId = null;
 
-  // Final state animation
-  let overlay = null;     // {cx, cy, r, progress, score}
-  let overlayRafId = null;
+  let drawStartTime = 0;
+  let direction = 0;                // 0 unknown, +1 ccw (positive in math), -1 cw
+  let cumulativeAngle = 0;
+  let prevAngle = 0;
+  let aborted = false;
+
+  let messageTimeoutId = null;
 
   // Best score (persistent)
-  const BEST_KEY = "perfect_circle_best_v1";
+  const BEST_KEY = "perfect_circle_best_v2";
   let bestScore = parseFloat(localStorage.getItem(BEST_KEY) || "0") || 0;
   updateBestUI();
 
@@ -48,6 +67,8 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    centerX = width / 2;
+    centerY = height / 2;
     redrawAll();
   }
   window.addEventListener("resize", resize, { passive: true });
@@ -55,9 +76,17 @@
 
   // ───── Helpers ─────
   function getPoint(e) {
-    const t = e.touches && e.touches[0];
-    const x = t ? t.clientX : e.clientX;
-    const y = t ? t.clientY : e.clientY;
+    let x, y;
+    if (e.touches && e.touches[0]) {
+      x = e.touches[0].clientX;
+      y = e.touches[0].clientY;
+    } else if (e.changedTouches && e.changedTouches[0]) {
+      x = e.changedTouches[0].clientX;
+      y = e.changedTouches[0].clientY;
+    } else {
+      x = e.clientX;
+      y = e.clientY;
+    }
     return { x, y, t: performance.now() };
   }
 
@@ -65,49 +94,80 @@
     ctx.clearRect(0, 0, width, height);
   }
 
+  function drawCenterDot() {
+    // Soft halo
+    const grad = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, CENTER_DOT_HALO);
+    grad.addColorStop(0, "rgba(255, 209, 102, 0.55)");
+    grad.addColorStop(1, "rgba(255, 209, 102, 0)");
+    ctx.save();
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, CENTER_DOT_HALO, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Solid dot
+    ctx.fillStyle = "#ffd166";
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, CENTER_DOT_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Inner highlight
+    ctx.fillStyle = "rgba(255, 255, 255, 0.7)";
+    ctx.beginPath();
+    ctx.arc(centerX - 1.3, centerY - 1.3, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
   function redrawAll() {
     clearCanvas();
+    drawCenterDot();
     if (points.length > 1) {
-      drawSmoothPath(points, "#ffffff", 2.4, 1);
-    }
-    if (overlay) {
-      drawOverlay(overlay);
+      drawSmoothPath(points, BRUSH_COLOR, BRUSH_WIDTH);
     }
   }
 
-  // ───── Smooth quadratic stroke ─────
-  function drawSmoothPath(pts, color, width, alpha = 1) {
+  // ───── Smooth quadratic stroke (full re-draw) ─────
+  function drawSmoothPath(pts, color, lineWidth) {
     if (pts.length < 2) return;
     ctx.save();
-    ctx.globalAlpha = alpha;
     ctx.strokeStyle = color;
-    ctx.lineWidth = width;
+    ctx.lineWidth = lineWidth;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    ctx.shadowColor = "rgba(255, 255, 255, 0.12)";
+    ctx.shadowBlur = 8;
     ctx.beginPath();
     ctx.moveTo(pts[0].x, pts[0].y);
-    for (let i = 1; i < pts.length - 1; i++) {
-      const xc = (pts[i].x + pts[i + 1].x) / 2;
-      const yc = (pts[i].y + pts[i + 1].y) / 2;
-      ctx.quadraticCurveTo(pts[i].x, pts[i].y, xc, yc);
+    if (pts.length === 2) {
+      ctx.lineTo(pts[1].x, pts[1].y);
+    } else {
+      for (let i = 1; i < pts.length - 1; i++) {
+        const xc = (pts[i].x + pts[i + 1].x) / 2;
+        const yc = (pts[i].y + pts[i + 1].y) / 2;
+        ctx.quadraticCurveTo(pts[i].x, pts[i].y, xc, yc);
+      }
+      const last = pts[pts.length - 1];
+      ctx.lineTo(last.x, last.y);
     }
-    const last = pts[pts.length - 1];
-    ctx.lineTo(last.x, last.y);
     ctx.stroke();
     ctx.restore();
   }
 
-  // Incremental drawing while user moves (avoids re-rendering whole stroke each frame)
+  // Incremental drawing while user moves — keeps things buttery
   function drawIncremental() {
     if (points.length < 3) return;
     const startIdx = Math.max(1, lastDrawIndex);
+    if (startIdx >= points.length - 1) return;
+
     ctx.save();
-    ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 2.4;
+    ctx.strokeStyle = BRUSH_COLOR;
+    ctx.lineWidth = BRUSH_WIDTH;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    ctx.shadowColor = "rgba(255, 255, 255, 0.12)";
+    ctx.shadowBlur = 8;
     ctx.beginPath();
-    // Begin from previously drawn midpoint to keep continuity
     const prev = points[startIdx - 1];
     ctx.moveTo((prev.x + points[startIdx].x) / 2, (prev.y + points[startIdx].y) / 2);
     for (let i = startIdx; i < points.length - 1; i++) {
@@ -120,96 +180,103 @@
     lastDrawIndex = points.length - 1;
   }
 
-  // ───── Scoring ─────
-  function computeCenter(pts) {
-    let sx = 0, sy = 0;
-    for (const p of pts) { sx += p.x; sy += p.y; }
-    return { x: sx / pts.length, y: sy / pts.length };
+  // ───── Direction & timing checks ─────
+  function updateDirectionTracking(p) {
+    const a = Math.atan2(p.y - centerY, p.x - centerX);
+    if (points.length === 1) {
+      prevAngle = a;
+      cumulativeAngle = 0;
+      direction = 0;
+      return;
+    }
+    let da = a - prevAngle;
+    if (da > Math.PI) da -= 2 * Math.PI;
+    else if (da < -Math.PI) da += 2 * Math.PI;
+    cumulativeAngle += da;
+    prevAngle = a;
+
+    if (direction === 0) {
+      if (Math.abs(cumulativeAngle) >= DIRECTION_LOCK_ANGLE) {
+        direction = cumulativeAngle > 0 ? 1 : -1;
+      }
+    } else {
+      // Once locked, if user reverses far enough, abort
+      if (direction === 1 && cumulativeAngle <= -DIRECTION_REVERSE_ANGLE) {
+        return abortRun("u can not change direction");
+      }
+      if (direction === -1 && cumulativeAngle >= DIRECTION_REVERSE_ANGLE) {
+        return abortRun("u can not change direction");
+      }
+    }
   }
 
-  function computeRadius(pts, center) {
-    let sum = 0;
-    for (const p of pts) {
-      const dx = p.x - center.x;
-      const dy = p.y - center.y;
-      sum += Math.hypot(dx, dy);
-    }
-    return sum / pts.length;
-  }
-
-  // Mean absolute radial deviation, normalized by radius
-  function computeScore(pts) {
-    if (pts.length < 12) return { score: 0, center: null, radius: 0 };
-
-    const center = computeCenter(pts);
-    const radius = computeRadius(pts, center);
-    if (radius < 12) return { score: 0, center, radius };
-
-    let errSum = 0;
-    for (const p of pts) {
-      const d = Math.hypot(p.x - center.x, p.y - center.y);
-      errSum += Math.abs(d - radius);
-    }
-    const meanErr = errSum / pts.length;
-    const normalized = meanErr / radius; // 0 = perfect
-
-    // Closure penalty: distance between first and last point relative to radius
-    const closure = Math.hypot(pts[0].x - pts[pts.length - 1].x, pts[0].y - pts[pts.length - 1].y) / radius;
-    const closurePenalty = Math.min(closure * 0.15, 0.25); // cap at 25 pts
-
-    // Coverage check: total signed angular sweep should be ~2π (full revolution)
-    let totalAngle = 0;
-    let prevAng = Math.atan2(pts[0].y - center.y, pts[0].x - center.x);
-    for (let i = 1; i < pts.length; i++) {
-      const a = Math.atan2(pts[i].y - center.y, pts[i].x - center.x);
-      let da = a - prevAng;
-      if (da > Math.PI) da -= 2 * Math.PI;
-      else if (da < -Math.PI) da += 2 * Math.PI;
-      totalAngle += da;
-      prevAng = a;
-    }
-    const sweep = Math.min(Math.abs(totalAngle) / (2 * Math.PI), 1.05);
-    const coveragePenalty = sweep < 0.9 ? (0.9 - sweep) * 0.6 : 0; // big penalty if not closed
-
-    let score = 100 - normalized * 100 - closurePenalty * 100 - coveragePenalty * 100;
-    if (!isFinite(score)) score = 0;
-    score = Math.max(0, Math.min(100, score));
-
-    return { score, center, radius };
+  function abortRun(msg) {
+    if (aborted) return;
+    aborted = true;
+    drawing = false;
+    document.body.classList.remove("drawing");
+    showMessage(msg);
+    // Quick flash, then reset
+    setTimeout(() => {
+      reset(false);
+    }, 1200);
   }
 
   // ───── Pointer handlers ─────
   function start(e) {
     if (e.cancelable) e.preventDefault();
+
+    const p = getPoint(e);
+    const dx = p.x - centerX;
+    const dy = p.y - centerY;
+    const dist = Math.hypot(dx, dy);
+
+    // Must start near the center dot
+    if (dist > START_RADIUS_TOLERANCE) {
+      showMessage("start from the center dot");
+      return;
+    }
+
     // Reset any previous run
-    cancelOverlayAnim();
-    overlay = null;
+    aborted = false;
     points = [];
     lastDrawIndex = 0;
+    cumulativeAngle = 0;
+    direction = 0;
     drawing = true;
+    drawStartTime = performance.now();
     document.body.classList.add("drawing");
     hideResult();
     hintEl.classList.add("hidden");
-    clearCanvas();
+    hideMessage();
+    redrawAll();
 
-    points.push(getPoint(e));
+    points.push(p);
+    prevAngle = Math.atan2(p.y - centerY, p.x - centerX);
   }
 
   function move(e) {
-    if (!drawing) return;
+    if (!drawing || aborted) return;
     if (e.cancelable) e.preventDefault();
+
+    // Time check
+    const now = performance.now();
+    if (now - drawStartTime > MAX_DRAW_TIME_MS) {
+      return abortRun("you took too long");
+    }
 
     const p = getPoint(e);
     const last = points[points.length - 1];
-    // Dedupe close points to keep array efficient and smooth
     if (last) {
       const dx = p.x - last.x;
       const dy = p.y - last.y;
-      if (dx * dx + dy * dy < 1.5) return;
+      // Smaller dedupe threshold = smoother, but still efficient
+      if (dx * dx + dy * dy < 1.0) return;
     }
     points.push(p);
+    updateDirectionTracking(p);
+    if (aborted) return;
 
-    // Throttle render to next animation frame
     if (!rafId) {
       rafId = requestAnimationFrame(() => {
         rafId = null;
@@ -219,92 +286,89 @@
   }
 
   function end(e) {
-    if (!drawing) return;
+    if (!drawing || aborted) {
+      drawing = false;
+      return;
+    }
     if (e && e.cancelable) e.preventDefault();
     drawing = false;
     document.body.classList.remove("drawing");
 
-    // Final clean redraw with smooth curves
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+
+    // Final clean redraw
     redrawAll();
 
-    const { score, center, radius } = computeScore(points);
+    const score = computeScore(points);
+    const radius = computeRadius(points);
 
-    if (!center || radius < 20 || points.length < 20) {
-      // Too small / too short — silent reset, show hint again
-      hintEl.classList.remove("hidden");
-      points = [];
-      lastDrawIndex = 0;
-      clearCanvas();
+    if (radius < MIN_RADIUS || points.length < 12) {
+      // too small — silent reset
+      reset(true);
       return;
     }
 
     showResult(score);
-    animateOverlay(center, radius, score);
   }
 
-  // ───── Overlay (perfect circle) animation ─────
-  function animateOverlay(center, radius, score) {
-    overlay = { cx: center.x, cy: center.y, r: radius, progress: 0, score };
-    const start = performance.now();
-    const dur = 650;
-
-    const tick = (now) => {
-      const t = Math.min(1, (now - start) / dur);
-      // easeOutCubic
-      const eased = 1 - Math.pow(1 - t, 3);
-      overlay.progress = eased;
-      redrawAll();
-      if (t < 1) {
-        overlayRafId = requestAnimationFrame(tick);
-      } else {
-        overlayRafId = null;
-      }
-    };
-    overlayRafId = requestAnimationFrame(tick);
+  // ───── Scoring ─────
+  function computeRadius(pts) {
+    let sum = 0;
+    for (const p of pts) sum += Math.hypot(p.x - centerX, p.y - centerY);
+    return sum / pts.length;
   }
 
-  function cancelOverlayAnim() {
-    if (overlayRafId) {
-      cancelAnimationFrame(overlayRafId);
-      overlayRafId = null;
+  function computeScore(pts) {
+    if (pts.length < 12) return 0;
+    const radius = computeRadius(pts);
+    if (radius < MIN_RADIUS) return 0;
+
+    // Mean absolute radial deviation, normalized
+    let errSum = 0;
+    for (const p of pts) {
+      const d = Math.hypot(p.x - centerX, p.y - centerY);
+      errSum += Math.abs(d - radius);
     }
+    const meanErr = errSum / pts.length;
+    const normalized = meanErr / radius;
+
+    // Closure: distance between first and last point relative to radius
+    const closure = Math.hypot(pts[0].x - pts[pts.length - 1].x, pts[0].y - pts[pts.length - 1].y) / radius;
+    const closurePenalty = Math.min(closure * 0.18, 0.3);
+
+    // Coverage: total signed angular sweep should be ~2π
+    const sweep = Math.min(Math.abs(cumulativeAngle) / (2 * Math.PI), 1.05);
+    const coveragePenalty = sweep < 0.9 ? (0.9 - sweep) * 0.7 : 0;
+
+    let score = 100 - normalized * 100 - closurePenalty * 100 - coveragePenalty * 100;
+    if (!isFinite(score)) score = 0;
+    return Math.max(0, Math.min(100, score));
   }
 
-  function drawOverlay(o) {
-    ctx.save();
-    // Color by score
-    const color = scoreColor(o.score);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.5;
-    ctx.globalAlpha = 0.85;
-    ctx.setLineDash([]);
-    ctx.beginPath();
-    const startAng = -Math.PI / 2;
-    ctx.arc(o.cx, o.cy, o.r, startAng, startAng + Math.PI * 2 * o.progress);
-    ctx.stroke();
-
-    // tiny center dot
-    if (o.progress > 0.1) {
-      ctx.globalAlpha = 0.5 * o.progress;
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(o.cx, o.cy, 1.5, 0, Math.PI * 2);
-      ctx.fill();
+  // ───── Messages ─────
+  function showMessage(text) {
+    if (messageTimeoutId) {
+      clearTimeout(messageTimeoutId);
+      messageTimeoutId = null;
     }
-    ctx.restore();
+    messageTextEl.textContent = text;
+    messageEl.classList.add("show");
+    messageEl.setAttribute("aria-hidden", "false");
+    messageTimeoutId = setTimeout(() => {
+      hideMessage();
+    }, 1600);
   }
 
-  function scoreColor(s) {
-    // monochrome premium: just white tones, slight tint at extremes
-    if (s >= 95) return "#7CFFB2";   // mint
-    if (s >= 85) return "#ffffff";
-    if (s >= 70) return "#ffffff";
-    return "#ff8a8a"; // soft red for poor
+  function hideMessage() {
+    messageEl.classList.remove("show");
+    messageEl.setAttribute("aria-hidden", "true");
   }
 
   // ───── Result UI ─────
   function showResult(score) {
-    const display = score.toFixed(1);
     animateScoreCount(score);
     resultEl.classList.remove("tier-low", "tier-mid", "tier-high");
     if (score >= 90) resultEl.classList.add("tier-high");
@@ -314,7 +378,6 @@
     resultEl.classList.add("show");
     resultEl.setAttribute("aria-hidden", "false");
 
-    // Best score handling
     if (score > bestScore) {
       bestScore = score;
       try { localStorage.setItem(BEST_KEY, String(bestScore)); } catch (_) {}
@@ -329,12 +392,11 @@
 
   function animateScoreCount(target) {
     const dur = 700;
-    const start = performance.now();
-    const from = 0;
+    const startT = performance.now();
     const tick = (now) => {
-      const t = Math.min(1, (now - start) / dur);
+      const t = Math.min(1, (now - startT) / dur);
       const eased = 1 - Math.pow(1 - t, 3);
-      const v = from + (target - from) * eased;
+      const v = target * eased;
       scoreEl.textContent = v.toFixed(1);
       if (t < 1) requestAnimationFrame(tick);
       else scoreEl.textContent = target.toFixed(1);
@@ -343,20 +405,32 @@
   }
 
   function updateBestUI() {
-    if (bestScore > 0) {
-      bestEl.textContent = bestScore.toFixed(1) + "%";
-    } else {
-      bestEl.textContent = "—";
+    bestEl.textContent = bestScore > 0 ? bestScore.toFixed(1) + "%" : "—";
+  }
+
+  // ───── Reset ─────
+  function reset(showHint = true) {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
     }
+    points = [];
+    lastDrawIndex = 0;
+    drawing = false;
+    aborted = false;
+    cumulativeAngle = 0;
+    direction = 0;
+    document.body.classList.remove("drawing");
+    redrawAll();
+    hideResult();
+    if (showHint) hintEl.classList.remove("hidden");
   }
 
   // ───── Events ─────
-  // Pointer events cover mouse + touch + pen on modern browsers
   if (window.PointerEvent) {
     canvas.addEventListener("pointerdown", (e) => {
-      // Only primary button for mouse
       if (e.pointerType === "mouse" && e.button !== 0) return;
-      canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
+      try { canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId); } catch (_) {}
       start(e);
     });
     canvas.addEventListener("pointermove", move);
@@ -366,7 +440,6 @@
       if (drawing) end(e);
     });
   } else {
-    // Fallback
     canvas.addEventListener("mousedown", start);
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", end);
@@ -376,34 +449,21 @@
     canvas.addEventListener("touchcancel", end, { passive: false });
   }
 
-  // Prevent context menu on long-press
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
   retryBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    reset();
+    reset(true);
   });
 
-  // Click anywhere outside the retry button after a result resets too
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape" || e.key === " " || e.key === "Enter") {
       if (resultEl.classList.contains("show")) {
         e.preventDefault();
-        reset();
+        reset(true);
       }
     }
   });
-
-  function reset() {
-    cancelOverlayAnim();
-    overlay = null;
-    points = [];
-    lastDrawIndex = 0;
-    drawing = false;
-    clearCanvas();
-    hideResult();
-    hintEl.classList.remove("hidden");
-  }
 
   // ───── Boot ─────
   resize();

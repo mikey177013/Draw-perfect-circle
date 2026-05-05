@@ -1,53 +1,68 @@
-# Perfect Circle
+# Draw a Perfect Circle
 
-Draw a circle. Get scored on how perfect it is.
+A premium, smooth, fixed-center take on the classic "draw a perfect circle" challenge.
+Anchor your stroke at the glowing center dot, draw freely, and get scored on precision.
 
-A minimal, premium clone of [neal.fun/perfect-circle](https://neal.fun/perfect-circle/) with clean typography, smooth canvas drawing, accurate scoring math, and zero clutter.
+> Live: deploy with one click to Vercel — pure static site, zero build step.
 
-## Features
+---
 
-- Fullscreen canvas with mouse / touch / pen support
-- DPR-aware crisp rendering
-- Smooth quadratic-curve stroke (no jagged lines)
-- Accurate score based on radial deviation, closure, and angular coverage
-- Animated overlay of the *perfect* circle after release
-- Best score saved to `localStorage`
-- SVG icons, no emoji
-- Black background, Instrument Serif italic for the score
+## What's new in this build
+
+- **Funky cartoon display font** — `Bagel Fat One` for the headline & score, `Space Grotesk` for UI
+- **Fixed center anchor** — a glowing dot marks the circle's center; every stroke must start there
+- **Free brush** — no auto-correct, no smoothing magic; you draw exactly what you draw
+- **Thicker, smoother stroke** — quadratic Bézier curves with incremental rendering for zero lag
+- **Direction lock** — switching from clockwise to counter-clockwise (or vice versa) shows
+  `u can not change direction`
+- **Time limit** — taking longer than 6 seconds shows `you took too long`
+- **Clean result screen** — only the user-drawn circle is shown (no "ideal" overlay)
+- **Polished UI** — gradient typography, glassy chrome, no emoji (SVG icons only)
 
 ## Run locally
 
-Just open `index.html` in a browser, or:
-
 ```bash
 npm start
+# or
+npx serve .
 ```
+
+Then open http://localhost:3000
 
 ## Deploy to Vercel
 
-This is a pure static site — push to GitHub and import on Vercel, or:
+This is a pure static site. Push to GitHub and import on Vercel, or:
 
 ```bash
 npx vercel --prod
 ```
 
-No build step is required.
+No build step is required. Zero errors, zero config beyond `vercel.json` for caching headers.
 
 ## How scoring works
 
-1. Compute centroid of all sampled points.
-2. Compute mean radius from centroid.
-3. Compute mean absolute radial deviation, normalized by radius.
-4. Apply small penalties for poor closure (start ≠ end) and incomplete sweep (< 360°).
-5. Clamp to 0–100.
+1. Mean radius from the **fixed center dot** is computed across all sampled points.
+2. Mean absolute radial deviation is computed and normalized by the radius.
+3. Small penalties are applied for poor closure (start ≠ end) and incomplete sweep (< 360°).
+4. Result is clamped to 0–100.
 
 ```
 score = 100 − (meanError / radius × 100) − closurePenalty − coveragePenalty
 ```
 
+## Controls
+
+- **Mouse / touch / pen**: press near the center dot, draw your circle, release
+- **Try again**: button on the result screen, or press `Esc` / `Space` / `Enter`
+
 ## Files
 
 - `index.html` — markup
-- `style.css` — styling
-- `script.js` — canvas + scoring logic
-- `vercel.json` — caching/headers
+- `style.css` — styling, typography, glass UI
+- `script.js` — canvas, drawing, scoring, direction & timing checks
+- `vercel.json` — caching/security headers
+- `package.json` — local dev script
+
+## License
+
+MIT

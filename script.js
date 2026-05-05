@@ -157,19 +157,16 @@
     const closure = Math.hypot(pts[0].x - pts[pts.length - 1].x, pts[0].y - pts[pts.length - 1].y) / radius;
     const closurePenalty = Math.min(closure * 0.15, 0.25); // cap at 25 pts
 
-    // Coverage check: angular span should be ~2π (full revolution)
-    let minAng = Infinity, maxAng = -Infinity;
+    // Coverage check: total signed angular sweep should be ~2π (full revolution)
     let totalAngle = 0;
     let prevAng = Math.atan2(pts[0].y - center.y, pts[0].x - center.x);
     for (let i = 1; i < pts.length; i++) {
       const a = Math.atan2(pts[i].y - center.y, pts[i].x - center.x);
       let da = a - prevAng;
-      while (da > Math.PI) da -= 2 * Math.PI;
-      while (da < -Math.PI) da += 2 * Math.PI;
+      if (da > Math.PI) da -= 2 * Math.PI;
+      else if (da < -Math.PI) da += 2 * Math.PI;
       totalAngle += da;
       prevAng = a;
-      if (a < minAng) minAng = a;
-      if (a > maxAng) maxAng = a;
     }
     const sweep = Math.min(Math.abs(totalAngle) / (2 * Math.PI), 1.05);
     const coveragePenalty = sweep < 0.9 ? (0.9 - sweep) * 0.6 : 0; // big penalty if not closed

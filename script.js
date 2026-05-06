@@ -1,7 +1,9 @@
-/* Perfect Circle — premium build
-   - Fixed center dot anchor
-   - Free, smooth, low-latency brush (no auto-improve)
-   - Detects "took too long" and "changed direction"
+/* Perfect Circle — sketchy/cartoon build
+   - Fixed white center dot (universal)
+   - Exclusion zone around dot (cannot draw too close)
+   - Free brush, smooth, low-latency, no auto-improve
+   - Rainbow-by-accuracy stroke recoloring on result
+   - Detects "you took too long" and "u can not change direction"
    - Shows ONLY the user-drawn circle on the result screen
 */
 
@@ -14,44 +16,48 @@
   const hintEl = document.getElementById("hint");
   const resultEl = document.getElementById("result");
   const scoreEl = document.getElementById("score");
+  const scoreLabelEl = document.getElementById("score-label");
   const retryBtn = document.getElementById("retry");
+  const copyBtn = document.getElementById("copy");
+  const copyLabelEl = document.getElementById("copy-label");
   const bestEl = document.getElementById("best-value");
   const messageEl = document.getElementById("message");
+  const messageScoreEl = document.getElementById("message-score");
   const messageTextEl = document.getElementById("message-text");
 
   // ───── Tunables ─────
-  const BRUSH_WIDTH = 5.5;          // thicker brush
+  const BRUSH_WIDTH = 6;
   const BRUSH_COLOR = "#ffffff";
-  const CENTER_DOT_RADIUS = 6;
-  const CENTER_DOT_HALO = 14;
-  const MIN_RADIUS = 28;            // ignore tiny scribbles
-  const MAX_DRAW_TIME_MS = 6000;    // "you took too long"
-  const DIRECTION_LOCK_ANGLE = Math.PI * 0.35; // ~63° net rotation before locking
-  const DIRECTION_REVERSE_ANGLE = Math.PI * 0.55; // reverse threshold
-  const START_RADIUS_TOLERANCE = 90; // user must start near the center dot
+  const CENTER_DOT_RADIUS = 4.5;     // small white dot
+  const NO_DRAW_RADIUS = 36;         // exclusion zone (cannot draw inside)
+  const MIN_RADIUS = 50;             // ignore tiny scribbles
+  const MAX_DRAW_TIME_MS = 6000;     // "you took too long"
+  const DIRECTION_LOCK_ANGLE = Math.PI * 0.35;
+  const DIRECTION_REVERSE_ANGLE = Math.PI * 0.55;
 
   // ───── State ─────
   let dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
-  let width = 0;
-  let height = 0;
-  let centerX = 0;
-  let centerY = 0;
+  let width = 0, height = 0;
+  let centerX = 0, centerY = 0;
 
   let drawing = false;
-  let points = [];                  // {x, y, t}
+  let points = [];
   let lastDrawIndex = 0;
   let rafId = null;
 
   let drawStartTime = 0;
-  let direction = 0;                // 0 unknown, +1 ccw (positive in math), -1 cw
+  let direction = 0;
   let cumulativeAngle = 0;
   let prevAngle = 0;
   let aborted = false;
 
   let messageTimeoutId = null;
+  let resultMode = false;       // when true, draw rainbow stroke instead of white
+  let resultRadius = 0;
+  let resultErrors = [];        // per-segment error normalized 0..1
 
   // Best score (persistent)
-  const BEST_KEY = "perfect_circle_best_v2";
+  const BEST_KEY = "perfect_circle_best_v3";
   let bestScore = parseFloat(localStorage.getItem(BEST_KEY) || "0") || 0;
   updateBestUI();
 
@@ -78,14 +84,11 @@
   function getPoint(e) {
     let x, y;
     if (e.touches && e.touches[0]) {
-      x = e.touches[0].clientX;
-      y = e.touches[0].clientY;
+      x = e.touches[0].clientX; y = e.touches[0].clientY;
     } else if (e.changedTouches && e.changedTouches[0]) {
-      x = e.changedTouches[0].clientX;
-      y = e.changedTouches[0].clientY;
+      x = e.changedTouches[0].clientX; y = e.changedTouches[0].clientY;
     } else {
-      x = e.clientX;
-      y = e.clientY;
+      x = e.clientX; y = e.clientY;
     }
     return { x, y, t: performance.now() };
   }
@@ -95,39 +98,34 @@
   }
 
   function drawCenterDot() {
-    // Soft halo
-    const grad = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, CENTER_DOT_HALO);
-    grad.addColorStop(0, "rgba(255, 209, 102, 0.55)");
-    grad.addColorStop(1, "rgba(255, 209, 102, 0)");
     ctx.save();
+    // tiny soft glow
+    const grad = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, 12);
+    grad.addColorStop(0, "rgba(255, 255, 255, 0.35)");
+    grad.addColorStop(1, "rgba(255, 255, 255, 0)");
     ctx.fillStyle = grad;
     ctx.beginPath();
-    ctx.arc(centerX, centerY, CENTER_DOT_HALO, 0, Math.PI * 2);
+    ctx.arc(centerX, centerY, 12, 0, Math.PI * 2);
     ctx.fill();
-
-    // Solid dot
-    ctx.fillStyle = "#ffd166";
+    // solid white dot
+    ctx.fillStyle = "#ffffff";
     ctx.beginPath();
     ctx.arc(centerX, centerY, CENTER_DOT_RADIUS, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Inner highlight
-    ctx.fillStyle = "rgba(255, 255, 255, 0.7)";
-    ctx.beginPath();
-    ctx.arc(centerX - 1.3, centerY - 1.3, 1.6, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
   }
 
   function redrawAll() {
     clearCanvas();
-    drawCenterDot();
-    if (points.length > 1) {
+    if (resultMode && points.length > 1) {
+      drawRainbowPath(points);
+    } else if (points.length > 1) {
       drawSmoothPath(points, BRUSH_COLOR, BRUSH_WIDTH);
     }
+    drawCenterDot();
   }
 
-  // ───── Smooth quadratic stroke (full re-draw) ─────
+  // ───── Smooth quadratic stroke ─────
   function drawSmoothPath(pts, color, lineWidth) {
     if (pts.length < 2) return;
     ctx.save();
@@ -135,8 +133,8 @@
     ctx.lineWidth = lineWidth;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    ctx.shadowColor = "rgba(255, 255, 255, 0.12)";
-    ctx.shadowBlur = 8;
+    ctx.shadowColor = "rgba(255, 255, 255, 0.18)";
+    ctx.shadowBlur = 10;
     ctx.beginPath();
     ctx.moveTo(pts[0].x, pts[0].y);
     if (pts.length === 2) {
@@ -154,7 +152,7 @@
     ctx.restore();
   }
 
-  // Incremental drawing while user moves — keeps things buttery
+  // Incremental drawing while user moves
   function drawIncremental() {
     if (points.length < 3) return;
     const startIdx = Math.max(1, lastDrawIndex);
@@ -165,8 +163,8 @@
     ctx.lineWidth = BRUSH_WIDTH;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    ctx.shadowColor = "rgba(255, 255, 255, 0.12)";
-    ctx.shadowBlur = 8;
+    ctx.shadowColor = "rgba(255, 255, 255, 0.18)";
+    ctx.shadowBlur = 10;
     ctx.beginPath();
     const prev = points[startIdx - 1];
     ctx.moveTo((prev.x + points[startIdx].x) / 2, (prev.y + points[startIdx].y) / 2);
@@ -177,10 +175,41 @@
     }
     ctx.stroke();
     ctx.restore();
+    // re-stamp center dot on top
+    drawCenterDot();
     lastDrawIndex = points.length - 1;
   }
 
-  // ───── Direction & timing checks ─────
+  // ───── Rainbow accuracy stroke (final) ─────
+  function errorToColor(err) {
+    // err is normalized 0..1 (0 perfect, 1 bad)
+    // map to red(0deg) -> yellow(60) -> green(120)
+    const e = Math.min(1, Math.max(0, err));
+    const hue = (1 - e) * 130; // 0..130
+    return `hsl(${hue.toFixed(0)}, 95%, 58%)`;
+  }
+
+  function drawRainbowPath(pts) {
+    if (pts.length < 2 || resultErrors.length !== pts.length) return;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = BRUSH_WIDTH;
+    ctx.shadowColor = "rgba(255, 255, 255, 0.15)";
+    ctx.shadowBlur = 14;
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i];
+      const e = (resultErrors[i - 1] + resultErrors[i]) * 0.5;
+      ctx.strokeStyle = errorToColor(e);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ───── Direction tracking ─────
   function updateDirectionTracking(p) {
     const a = Math.atan2(p.y - centerY, p.x - centerX);
     if (points.length === 1) {
@@ -200,7 +229,6 @@
         direction = cumulativeAngle > 0 ? 1 : -1;
       }
     } else {
-      // Once locked, if user reverses far enough, abort
       if (direction === 1 && cumulativeAngle <= -DIRECTION_REVERSE_ANGLE) {
         return abortRun("u can not change direction");
       }
@@ -216,10 +244,7 @@
     drawing = false;
     document.body.classList.remove("drawing");
     showMessage(msg);
-    // Quick flash, then reset
-    setTimeout(() => {
-      reset(false);
-    }, 1200);
+    setTimeout(() => reset(true), 1300);
   }
 
   // ───── Pointer handlers ─────
@@ -227,18 +252,17 @@
     if (e.cancelable) e.preventDefault();
 
     const p = getPoint(e);
-    const dx = p.x - centerX;
-    const dy = p.y - centerY;
-    const dist = Math.hypot(dx, dy);
+    const dist = Math.hypot(p.x - centerX, p.y - centerY);
 
-    // Must start near the center dot
-    if (dist > START_RADIUS_TOLERANCE) {
-      showMessage("start from the center dot");
+    // can't start inside the no-draw zone
+    if (dist < NO_DRAW_RADIUS) {
+      showMessage("too close to dot");
       return;
     }
 
-    // Reset any previous run
     aborted = false;
+    resultMode = false;
+    resultErrors = [];
     points = [];
     lastDrawIndex = 0;
     cumulativeAngle = 0;
@@ -259,18 +283,22 @@
     if (!drawing || aborted) return;
     if (e.cancelable) e.preventDefault();
 
-    // Time check
     const now = performance.now();
     if (now - drawStartTime > MAX_DRAW_TIME_MS) {
       return abortRun("you took too long");
     }
 
     const p = getPoint(e);
+
+    // can't cross into the exclusion zone
+    if (Math.hypot(p.x - centerX, p.y - centerY) < NO_DRAW_RADIUS) {
+      return abortRun("too close to dot");
+    }
+
     const last = points[points.length - 1];
     if (last) {
       const dx = p.x - last.x;
       const dy = p.y - last.y;
-      // Smaller dedupe threshold = smoother, but still efficient
       if (dx * dx + dy * dy < 1.0) return;
     }
     points.push(p);
@@ -299,18 +327,20 @@
       rafId = null;
     }
 
-    // Final clean redraw
     redrawAll();
 
-    const score = computeScore(points);
     const radius = computeRadius(points);
-
     if (radius < MIN_RADIUS || points.length < 12) {
-      // too small — silent reset
       reset(true);
       return;
     }
 
+    // compute score + per-point errors for rainbow
+    const { score, errors } = computeScoreAndErrors(points, radius);
+    resultErrors = errors;
+    resultRadius = radius;
+    resultMode = true;
+    redrawAll();
     showResult(score);
   }
 
@@ -321,31 +351,38 @@
     return sum / pts.length;
   }
 
-  function computeScore(pts) {
-    if (pts.length < 12) return 0;
-    const radius = computeRadius(pts);
-    if (radius < MIN_RADIUS) return 0;
+  function computeScoreAndErrors(pts, radius) {
+    if (pts.length < 12 || radius < MIN_RADIUS) return { score: 0, errors: [] };
 
-    // Mean absolute radial deviation, normalized
     let errSum = 0;
-    for (const p of pts) {
-      const d = Math.hypot(p.x - centerX, p.y - centerY);
-      errSum += Math.abs(d - radius);
+    const errors = new Array(pts.length);
+    let maxErr = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const d = Math.hypot(pts[i].x - centerX, pts[i].y - centerY);
+      const e = Math.abs(d - radius);
+      errors[i] = e;
+      errSum += e;
+      if (e > maxErr) maxErr = e;
     }
     const meanErr = errSum / pts.length;
     const normalized = meanErr / radius;
 
-    // Closure: distance between first and last point relative to radius
+    // Per-point errors normalized for color (relative to radius)
+    const colorScale = Math.max(radius * 0.18, 8);
+    for (let i = 0; i < errors.length; i++) {
+      errors[i] = Math.min(1, errors[i] / colorScale);
+    }
+
     const closure = Math.hypot(pts[0].x - pts[pts.length - 1].x, pts[0].y - pts[pts.length - 1].y) / radius;
     const closurePenalty = Math.min(closure * 0.18, 0.3);
 
-    // Coverage: total signed angular sweep should be ~2π
     const sweep = Math.min(Math.abs(cumulativeAngle) / (2 * Math.PI), 1.05);
     const coveragePenalty = sweep < 0.9 ? (0.9 - sweep) * 0.7 : 0;
 
     let score = 100 - normalized * 100 - closurePenalty * 100 - coveragePenalty * 100;
     if (!isFinite(score)) score = 0;
-    return Math.max(0, Math.min(100, score));
+    score = Math.max(0, Math.min(100, score));
+    return { score, errors };
   }
 
   // ───── Messages ─────
@@ -357,9 +394,7 @@
     messageTextEl.textContent = text;
     messageEl.classList.add("show");
     messageEl.setAttribute("aria-hidden", "false");
-    messageTimeoutId = setTimeout(() => {
-      hideMessage();
-    }, 1600);
+    messageTimeoutId = setTimeout(hideMessage, 1500);
   }
 
   function hideMessage() {
@@ -368,7 +403,9 @@
   }
 
   // ───── Result UI ─────
+  let lastScore = 0;
   function showResult(score) {
+    lastScore = score;
     animateScoreCount(score);
     resultEl.classList.remove("tier-low", "tier-mid", "tier-high");
     if (score >= 90) resultEl.classList.add("tier-high");
@@ -382,6 +419,9 @@
       bestScore = score;
       try { localStorage.setItem(BEST_KEY, String(bestScore)); } catch (_) {}
       updateBestUI();
+      scoreLabelEl.textContent = "new best";
+    } else {
+      scoreLabelEl.textContent = "tap retry";
     }
   }
 
@@ -397,9 +437,9 @@
       const t = Math.min(1, (now - startT) / dur);
       const eased = 1 - Math.pow(1 - t, 3);
       const v = target * eased;
-      scoreEl.textContent = v.toFixed(1);
+      scoreEl.innerHTML = v.toFixed(1) + "<i>%</i>";
       if (t < 1) requestAnimationFrame(tick);
-      else scoreEl.textContent = target.toFixed(1);
+      else scoreEl.innerHTML = target.toFixed(1) + "<i>%</i>";
     };
     requestAnimationFrame(tick);
   }
@@ -420,6 +460,8 @@
     aborted = false;
     cumulativeAngle = 0;
     direction = 0;
+    resultMode = false;
+    resultErrors = [];
     document.body.classList.remove("drawing");
     redrawAll();
     hideResult();
@@ -436,9 +478,7 @@
     canvas.addEventListener("pointermove", move);
     canvas.addEventListener("pointerup", end);
     canvas.addEventListener("pointercancel", end);
-    canvas.addEventListener("pointerleave", (e) => {
-      if (drawing) end(e);
-    });
+    canvas.addEventListener("pointerleave", (e) => { if (drawing) end(e); });
   } else {
     canvas.addEventListener("mousedown", start);
     window.addEventListener("mousemove", move);
@@ -454,6 +494,29 @@
   retryBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     reset(true);
+  });
+
+  copyBtn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const text = `${lastScore.toFixed(1)}% — Perfect Circle`;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      const old = copyLabelEl.textContent;
+      copyLabelEl.textContent = "Copied";
+      setTimeout(() => { copyLabelEl.textContent = old || "Copy"; }, 1100);
+    } catch (_) {
+      copyLabelEl.textContent = "Failed";
+      setTimeout(() => { copyLabelEl.textContent = "Copy"; }, 1100);
+    }
   });
 
   window.addEventListener("keydown", (e) => {
